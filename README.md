@@ -94,3 +94,40 @@ public class ClassListerAgent {
     </plugin>
   </plugins>
 </build>
+
+
+
+
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.util.ArrayList;
+import java.util.List;
+
+public class ClassPreloader {
+
+    public static void preloadClasses(String resourcePath, ClassLoader classLoader) {
+        List<String> failed = new ArrayList<>();
+
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                classLoader.getResourceAsStream(resourcePath)))) {
+
+            String className;
+            while ((className = reader.readLine()) != null) {
+                try {
+                    Class.forName(className.trim(), true, classLoader);
+                } catch (Throwable t) {
+                    failed.add(className);
+                }
+            }
+
+            System.out.println("Preloading complete. Failed to load: " + failed.size());
+            if (!failed.isEmpty()) {
+                failed.forEach(c -> System.out.println("Could not load: " + c));
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+}
