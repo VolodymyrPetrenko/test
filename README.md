@@ -63,3 +63,34 @@ public class ClassListerAgent {
         }));
     }
 }
+
+
+
+
+<build>
+  <plugins>
+    <plugin>
+      <groupId>org.apache.maven.plugins</groupId>
+      <artifactId>maven-shade-plugin</artifactId>
+      <version>3.2.4</version>
+      <executions>
+        <execution>
+          <phase>package</phase>
+          <goals>
+            <goal>shade</goal>
+          </goals>
+          <configuration>
+            <transformers>
+              <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                <mainClass>your.package.ClassListerAgent</mainClass>
+                <manifestEntries>
+                  <Premain-Class>your.package.ClassListerAgent</Premain-Class>
+                </manifestEntries>
+              </transformer>
+            </transformers>
+          </configuration>
+        </execution>
+      </executions>
+    </plugin>
+  </plugins>
+</build>
