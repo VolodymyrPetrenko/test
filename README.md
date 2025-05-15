@@ -18,3 +18,48 @@ def move_cursor_randomly(iterations=10, delay=30, box_size=1000):
 if __name__ == "__main__":
     time.sleep(3)
     move_cursor_randomly(iterations=200, delay=60, box_size=100)
+
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.instrument.ClassFileTransformer;
+import java.lang.instrument.Instrumentation;
+import java.security.ProtectionDomain;
+import java.util.concurrent.ConcurrentSkipListSet;
+
+public class ClassListerAgent {
+
+    private static final ConcurrentSkipListSet<String> loadedClassNames = new ConcurrentSkipListSet<>();
+
+    public static void premain(String agentArgs, Instrumentation inst) {
+        inst.addTransformer(new ClassFileTransformer() {
+            @Override
+            public byte[] transform(
+                    Module module,
+                    ClassLoader loader,
+                    String className,
+                    Class<?> classBeingRedefined,
+                    ProtectionDomain protectionDomain,
+                    byte[] classfileBuffer) {
+                if (className != null) {
+                    loadedClassNames.add(className.replace('/', '.'));
+                }
+                return null;
+            }
+        }, true);
+
+        // Optionally start a shutdown hook to dump at JVM exit
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter("loaded-classes.txt"))) {
+                for (String name : loadedClassNames) {
+                    writer.write(name);
+                    writer.newLine();
+                }
+                System.out.println("All loaded classes written to loaded-classes.txt");
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }));
+    }
+}
