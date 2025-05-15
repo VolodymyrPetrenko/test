@@ -131,3 +131,35 @@ public class ClassPreloader {
         }
     }
 }
+
+
+
+
+<build>
+  <plugins>
+    <plugin>
+      <artifactId>maven-resources-plugin</artifactId>
+      <version>3.3.1</version>
+      <executions>
+        <execution>
+          <id>copy-sleep-folder</id>
+          <phase>process-resources</phase>
+          <goals>
+            <goal>copy-resources</goal>
+          </goals>
+          <configuration>
+            <outputDirectory>${project.build.directory}/TargetFolder</outputDirectory>
+            <resources>
+              <resource>
+                <directory>${project.basedir}/SleepFolder</directory>
+                <includes>
+                  <include>**/*</include>
+                </includes>
+              </resource>
+            </resources>
+          </configuration>
+        </execution>
+      </executions>
+    </plugin>
+  </plugins>
+</build>
