@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+Simple proxy that on FIRST request:
+ - forwards the request to upstream (so upstream receives it)
+ - but DOES NOT return upstream response to client, simulating timeout/reset
+
+Modes (for first request behaviour):
+  drop_after_upstream   - send request upstream, then immediately close client connection
+  delay_after_upstream  - send request upstream, wait --delay seconds, then close client connection
+  504_after_upstream    - send request upstream, then reply HTTP 504 to client
+  (plus the older modes: drop, delay, 504, canned, proxy -- kept for compatibility)
+
+Usage example:
+  python simple_proxy_timeout.py --port 8888 --target http://httpbin.org --mode drop_after_upstream --delay 20
+
+Notes:
+ - "first"/"second" is tracked per (client_ip, path)
+ - counter resets after --reset-seconds
+"""
+import argparse, socket, threading, time, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from collections import defaultdict
+from urllib.parse import urljoin
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SimpleProxyTimeout/0.2"
+
+    def forward_to_upstream(self, upstream, method, headers, body, timeout):
+        """Perform the upstream request in background. Returns (code, headers, body) if called synchronously.
+           We generally call this in a background thread and ignore result."""
+        try:
+            req = urllib.request.Request(upstream, data=body, method=method)
+            hop_by_hop = set(['Connection','Keep-Alive','Proxy-Authenticate','Proxy-Authorization','TE','Trailers','Transfer-Encoding','Upgrade'])
+            for k,v in headers.items():
+                if k not in hop_by_hop:
+                    req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                resp_data = resp.read()
+                resp_headers = resp.getheaders()
+                return (resp.getcode(), resp_headers, resp_data)
+        except Exception as ex:
+            # return exception info so caller can decide (but in many modes we ignore)
+            return ("ERR", str(ex).encode('utf-8'))
+
+    def do_REQUEST(self):
+        key = (self.client_address[0], self.path)
+        cnt = self.server.counter[key]
+        method = self.command
+
+        # read request body if any
+        body = None
+        if 'Content-Length' in self.headers:
+            try:
+                length = int(self.headers['Content-Length'])
+                if length > 0:
+                    body = self.rfile.read(length)
+            except Exception:
+                body = None
+
+        upstream = urljoin(self.server.target, self.path)
+
+        # FIRST request behaviour
+        if cnt == 0:
+            self.server.counter[key] += 1
+
+            # perform upstream request in background (so upstream receives it)
+            bg = threading.Thread(target=self.forward_to_upstream,
+                                  args=(upstream, method, self.headers, body, self.server.upstream_timeout),
+                                  daemon=True)
+            bg.start()
+
+            # Now simulate different client-side failure behaviours *after* sending upstream:
+            if self.server.mode == 'drop_after_upstream':
+                # immediately close client connection -> client will get reset/EOF
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.request.close()
+                except Exception:
+                    pass
+                return
+
+            if self.server.mode == 'delay_after_upstream':
+                # wait configured delay, then close connection without reply
+                try:
+                    time.sleep(self.server.delay)
+                except Exception:
+                    pass
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.request.close()
+                except Exception:
+                    pass
+                return
+
+            if self.server.mode == '504_after_upstream':
+                # wait optionally a short moment to allow upstream to start
+                time.sleep(0.1)
+                try:
+                    self.send_response(504, "Gateway Timeout (simulated after upstream)")
+                    self.end_headers()
+                    self.wfile.write(b"Gateway Timeout (simulated after upstream)")
+                except Exception:
+                    pass
+                return
+
+            # legacy modes: if user used 'drop' or 'delay' etc that do not forward to upstream,
+            # keep previous semantics (no upstream call was made there). We only added the above three.
+            if self.server.mode == 'drop':
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.request.close()
+                except Exception:
+                    pass
+                return
+            if self.server.mode == 'delay':
+                time.sleep(self.server.delay)
+                # after delay, proceed to proxy below (so client eventually receives upstream result)
+            if self.server.mode == '504':
+                self.send_response(504, "Gateway Timeout")
+                self.end_headers()
+                self.wfile.write(b"Gateway Timeout (simulated)")
+                return
+
+        # SECOND+ request behaviour (normal): either canned or proxy to upstream synchronously and return result
+        if self.server.mode == 'canned' and self.server.canned_text is not None:
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('Content-Length', str(len(self.server.canned_text.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(self.server.canned_text.encode('utf-8'))
+            return
+
+        # Proxy synchronously (client gets upstream response)
+        method = self.command
+        req = urllib.request.Request(upstream, data=body, method=method)
+        hop_by_hop = set(['Connection','Keep-Alive','Proxy-Authenticate','Proxy-Authorization','TE','Trailers','Transfer-Encoding','Upgrade'])
+        for k,v in self.headers.items():
+            if k not in hop_by_hop:
+                req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, timeout=self.server.upstream_timeout) as resp:
+                self.send_response(resp.getcode())
+                for header, val in resp.getheaders():
+                    if header not in hop_by_hop:
+                        self.send_header(header, val)
+                self.end_headers()
+                data = resp.read()
+                if data:
+                    self.wfile.write(data)
+        except urllib.error.HTTPError as e:
+            try:
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(e.read() if e.fp else str(e).encode('utf-8'))
+            except Exception:
+                pass
+        except Exception as ex:
+            try:
+                self.send_response(502)
+                self.end_headers()
+                self.wfile.write(f"Bad Gateway: {ex}".encode('utf-8'))
+            except Exception:
+                pass
+
+    def do_GET(self):    return self.do_REQUEST()
+    def do_POST(self):   return self.do_REQUEST()
+    def do_PUT(self):    return self.do_REQUEST()
+    def do_DELETE(self): return self.do_REQUEST()
+    def do_HEAD(self):   return self.do_REQUEST()
+
+    def log_message(self, format, *args):
+        print("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), format%args))
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('--port', type=int, default=8888)
+    p.add_argument('--target', type=str, default='http://httpbin.org')
+    p.add_argument('--mode', choices=['drop_after_upstream','delay_after_upstream','504_after_upstream',
+                                      'drop','delay','504','canned','proxy'], default='drop_after_upstream')
+    p.add_argument('--delay', type=int, default=20, help='seconds for delay modes')
+    p.add_argument('--canned-text', type=str, default='OK (canned)')
+    p.add_argument('--reset-seconds', type=int, default=300, help='after this seconds the per-key counters are cleared')
+    p.add_argument('--upstream-timeout', type=int, default=10, help='timeout for upstream requests')
+    args = p.parse_args()
+
+    server = ThreadedHTTPServer(('0.0.0.0', args.port), Handler)
+    server.target = args.target
+    server.mode = args.mode
+    server.delay = args.delay
+    server.canned_text = args.canned_text
+    server.upstream_timeout = args.upstream_timeout
+    server.counter = defaultdict(int)
+
+    def cleaner():
+        while True:
+            time.sleep(args.reset_seconds)
+            server.counter.clear()
+
+    t = threading.Thread(target=cleaner, daemon=True)
+    t.start()
+
+    print("SimpleProxyTimeout listening on 0.0.0.0:%d   mode=%s   target=%s" % (args.port, args.mode, args.target))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Shutting down")
+        server.server_close()
+
+if __name__ == '__main__':
+    main()
