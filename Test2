@@ -1,184 +1,212 @@
 #!/usr/bin/env python3
-"""
-Simple proxy that on FIRST request:
- - forwards the request to upstream (so upstream receives it)
- - but DOES NOT return upstream response to client, simulating timeout/reset
+# connect_timeout_proxy.py
+# CONNECT proxy that for the FIRST CONNECT from a (client_ip, target) will forward client->server bytes
+# but then close the client socket (simulating timeout) BEFORE returning server response.
+#
+# Subsequent CONNECTs for same (client_ip, target) act as normal tunnel.
+#
+# Usage:
+#   python connect_timeout_proxy.py --port 8888 --first-delay 0.05 --reset-seconds 300
+#
+# Test (HTTPS):
+#   1) start proxy:
+#      python connect_timeout_proxy.py --port 8888
+#   2) first request (should fail / timeout on client side):
+#      curl -v -x http://localhost:8888 https://httpbin.org/get --http1.1
+#   3) second request (should succeed):
+#      curl -v -x http://localhost:8888 https://httpbin.org/get --http1.1
+#
+# Notes:
+# - Key used for first/second is (client_ip, target_host:port). If you prefer another key (header X-Test-Id),
+#   we can change it easily.
+# - If client is slow to send request bytes (e.g. slow handshake), increase --first-delay.
+# - This is NOT a MITM: proxy does not terminate TLS.
 
-Modes (for first request behaviour):
-  drop_after_upstream   - send request upstream, then immediately close client connection
-  delay_after_upstream  - send request upstream, wait --delay seconds, then close client connection
-  504_after_upstream    - send request upstream, then reply HTTP 504 to client
-  (plus the older modes: drop, delay, 504, canned, proxy -- kept for compatibility)
-
-Usage example:
-  python simple_proxy_timeout.py --port 8888 --target http://httpbin.org --mode drop_after_upstream --delay 20
-
-Notes:
- - "first"/"second" is tracked per (client_ip, path)
- - counter resets after --reset-seconds
-"""
-import argparse, socket, threading, time, urllib.request, urllib.error
+import argparse
+import socket
+import threading
+import time
+import select
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from collections import defaultdict
-from urllib.parse import urljoin
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "SimpleProxyTimeout/0.2"
+BUFFER_SIZE = 16384
 
-    def forward_to_upstream(self, upstream, method, headers, body, timeout):
-        """Perform the upstream request in background. Returns (code, headers, body) if called synchronously.
-           We generally call this in a background thread and ignore result."""
+class ConnectTimeoutHandler(BaseHTTPRequestHandler):
+    server_version = "ConnectTimeoutProxy/0.2"
+
+    def do_CONNECT(self):
+        target = self.path  # usually host:port
+        client_ip = self.client_address[0]
+        key = (client_ip, target)
+
+        # parse host/port
         try:
-            req = urllib.request.Request(upstream, data=body, method=method)
-            hop_by_hop = set(['Connection','Keep-Alive','Proxy-Authenticate','Proxy-Authorization','TE','Trailers','Transfer-Encoding','Upgrade'])
-            for k,v in headers.items():
-                if k not in hop_by_hop:
-                    req.add_header(k, v)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                resp_data = resp.read()
-                resp_headers = resp.getheaders()
-                return (resp.getcode(), resp_headers, resp_data)
-        except Exception as ex:
-            # return exception info so caller can decide (but in many modes we ignore)
-            return ("ERR", str(ex).encode('utf-8'))
-
-    def do_REQUEST(self):
-        key = (self.client_address[0], self.path)
-        cnt = self.server.counter[key]
-        method = self.command
-
-        # read request body if any
-        body = None
-        if 'Content-Length' in self.headers:
-            try:
-                length = int(self.headers['Content-Length'])
-                if length > 0:
-                    body = self.rfile.read(length)
-            except Exception:
-                body = None
-
-        upstream = urljoin(self.server.target, self.path)
-
-        # FIRST request behaviour
-        if cnt == 0:
-            self.server.counter[key] += 1
-
-            # perform upstream request in background (so upstream receives it)
-            bg = threading.Thread(target=self.forward_to_upstream,
-                                  args=(upstream, method, self.headers, body, self.server.upstream_timeout),
-                                  daemon=True)
-            bg.start()
-
-            # Now simulate different client-side failure behaviours *after* sending upstream:
-            if self.server.mode == 'drop_after_upstream':
-                # immediately close client connection -> client will get reset/EOF
-                try:
-                    self.request.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    self.request.close()
-                except Exception:
-                    pass
-                return
-
-            if self.server.mode == 'delay_after_upstream':
-                # wait configured delay, then close connection without reply
-                try:
-                    time.sleep(self.server.delay)
-                except Exception:
-                    pass
-                try:
-                    self.request.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    self.request.close()
-                except Exception:
-                    pass
-                return
-
-            if self.server.mode == '504_after_upstream':
-                # wait optionally a short moment to allow upstream to start
-                time.sleep(0.1)
-                try:
-                    self.send_response(504, "Gateway Timeout (simulated after upstream)")
-                    self.end_headers()
-                    self.wfile.write(b"Gateway Timeout (simulated after upstream)")
-                except Exception:
-                    pass
-                return
-
-            # legacy modes: if user used 'drop' or 'delay' etc that do not forward to upstream,
-            # keep previous semantics (no upstream call was made there). We only added the above three.
-            if self.server.mode == 'drop':
-                try:
-                    self.request.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    self.request.close()
-                except Exception:
-                    pass
-                return
-            if self.server.mode == 'delay':
-                time.sleep(self.server.delay)
-                # after delay, proceed to proxy below (so client eventually receives upstream result)
-            if self.server.mode == '504':
-                self.send_response(504, "Gateway Timeout")
-                self.end_headers()
-                self.wfile.write(b"Gateway Timeout (simulated)")
-                return
-
-        # SECOND+ request behaviour (normal): either canned or proxy to upstream synchronously and return result
-        if self.server.mode == 'canned' and self.server.canned_text is not None:
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.send_header('Content-Length', str(len(self.server.canned_text.encode('utf-8'))))
-            self.end_headers()
-            self.wfile.write(self.server.canned_text.encode('utf-8'))
+            host, port_s = target.split(":", 1)
+            port = int(port_s)
+        except Exception:
+            self.send_error(400, "Bad CONNECT target")
             return
 
-        # Proxy synchronously (client gets upstream response)
-        method = self.command
-        req = urllib.request.Request(upstream, data=body, method=method)
-        hop_by_hop = set(['Connection','Keep-Alive','Proxy-Authenticate','Proxy-Authorization','TE','Trailers','Transfer-Encoding','Upgrade'])
-        for k,v in self.headers.items():
-            if k not in hop_by_hop:
-                req.add_header(k, v)
+        # try connect to remote
         try:
-            with urllib.request.urlopen(req, timeout=self.server.upstream_timeout) as resp:
-                self.send_response(resp.getcode())
-                for header, val in resp.getheaders():
-                    if header not in hop_by_hop:
-                        self.send_header(header, val)
-                self.end_headers()
-                data = resp.read()
-                if data:
-                    self.wfile.write(data)
-        except urllib.error.HTTPError as e:
-            try:
-                self.send_response(e.code)
-                self.end_headers()
-                self.wfile.write(e.read() if e.fp else str(e).encode('utf-8'))
-            except Exception:
-                pass
-        except Exception as ex:
-            try:
-                self.send_response(502)
-                self.end_headers()
-                self.wfile.write(f"Bad Gateway: {ex}".encode('utf-8'))
-            except Exception:
-                pass
+            remote = socket.create_connection((host, port), timeout=self.server.upstream_timeout)
+        except Exception as e:
+            self.send_error(502, f"Cannot connect to {target}: {e}")
+            return
 
-    def do_GET(self):    return self.do_REQUEST()
-    def do_POST(self):   return self.do_REQUEST()
-    def do_PUT(self):    return self.do_REQUEST()
+        # send 200 Connection established
+        try:
+            self.send_response(200, "Connection established")
+            self.end_headers()
+        except Exception:
+            remote.close()
+            return
+
+        client_sock = self.request
+        remote.setblocking(False)
+        client_sock.setblocking(False)
+
+        # determine first/second
+        first = False
+        with self.server.state_lock:
+            cnt, last = self.server.counter.get(key, (0, 0.0))
+            now = time.time()
+            if cnt == 0 or (now - last) > self.server.reset_seconds:
+                # first
+                self.server.counter[key] = (1, now)
+                first = True
+            else:
+                # increment and update timestamp
+                self.server.counter[key] = (cnt + 1, now)
+                first = False
+
+        if first:
+            # For first connection: forward bytes client->remote for a short while (until we see some bytes),
+            # then schedule a close of client socket after first_delay seconds. We still forward remote->client
+            # only until we close client (we will not intentionally forward server's response).
+            closed_flag = threading.Event()
+
+            # background closer: waits delay then closes client socket (if not already closed)
+            def closer(delay, sock, evt):
+                time.sleep(delay)
+                try:
+                    # shutdown and close client socket to simulate abrupt disconnect / timeout
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    sock.close()
+                    evt.set()
+                    # log
+                    print(f"[proxy] first CONNECT -> closed client socket for key={key}")
+                except Exception as e:
+                    print(f"[proxy] error closing client socket: {e}")
+
+            # We'll start closer after we have forwarded at least one client->remote chunk
+            started_closer = False
+            closer_thread = None
+
+            sockets = [client_sock, remote]
+            try:
+                while True:
+                    r, _, _ = select.select(sockets, [], [], 1)
+                    if client_sock in r:
+                        try:
+                            data = client_sock.recv(BUFFER_SIZE)
+                        except Exception:
+                            break
+                        if not data:
+                            break
+                        # forward to remote
+                        try:
+                            remote.sendall(data)
+                        except Exception:
+                            break
+                        # once first data forwarded, start the closer thread (if not started)
+                        if (not started_closer):
+                            started_closer = True
+                            closer_thread = threading.Thread(target=closer, args=(self.server.first_delay, client_sock, closed_flag), daemon=True)
+                            closer_thread.start()
+
+                    # attempt to read from remote; but if we are in 'first' case we will not forward remote->client forever:
+                    if remote in r:
+                        try:
+                            data = remote.recv(BUFFER_SIZE)
+                        except Exception:
+                            break
+                        if not data:
+                            break
+                        # For first request: if client is closed (closed_flag), stop forwarding; else attempt to forward but client may be closed soon
+                        if not closed_flag.is_set():
+                            try:
+                                client_sock.sendall(data)
+                            except Exception:
+                                # client likely closed; we'll break
+                                break
+                        else:
+                            # client already closed, we don't forward server response
+                            break
+                    # if closer_thread finished and client closed, break
+                    if closed_flag.is_set():
+                        break
+            finally:
+                try: remote.close()
+                except: pass
+                try: client_sock.close()
+                except: pass
+            return
+
+        else:
+            # normal tunnel for second+ requests: full bidirectional proxy until either side closes
+            sockets = [client_sock, remote]
+            try:
+                while True:
+                    r, _, _ = select.select(sockets, [], [], 1)
+                    if client_sock in r:
+                        try:
+                            data = client_sock.recv(BUFFER_SIZE)
+                        except Exception:
+                            break
+                        if not data:
+                            break
+                        try:
+                            remote.sendall(data)
+                        except Exception:
+                            break
+                    if remote in r:
+                        try:
+                            data = remote.recv(BUFFER_SIZE)
+                        except Exception:
+                            break
+                        if not data:
+                            break
+                        try:
+                            client_sock.sendall(data)
+                        except Exception:
+                            break
+            finally:
+                try: remote.close()
+                except: pass
+                try: client_sock.close()
+                except: pass
+            return
+
+    # For plain HTTP requests (non-CONNECT) we implement a simple proxy pass-through (no special first behavior by default)
+    def do_REQUEST(self):
+        # Very simple: return 501 to indicate not implemented for plain HTTP in this script
+        self.send_error(501, "Plain HTTP proxying not implemented in this script. Use CONNECT (HTTPS) testing.")
+    def do_GET(self): return self.do_REQUEST()
+    def do_POST(self): return self.do_REQUEST()
+    def do_PUT(self): return self.do_REQUEST()
     def do_DELETE(self): return self.do_REQUEST()
-    def do_HEAD(self):   return self.do_REQUEST()
+    def do_HEAD(self): return self.do_REQUEST()
+    def do_OPTIONS(self): return self.do_REQUEST()
+    def do_PATCH(self): return self.do_REQUEST()
 
     def log_message(self, format, *args):
+        # keep concise logging to console
         print("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), format%args))
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -186,33 +214,37 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--port', type=int, default=8888)
-    p.add_argument('--target', type=str, default='http://httpbin.org')
-    p.add_argument('--mode', choices=['drop_after_upstream','delay_after_upstream','504_after_upstream',
-                                      'drop','delay','504','canned','proxy'], default='drop_after_upstream')
-    p.add_argument('--delay', type=int, default=20, help='seconds for delay modes')
-    p.add_argument('--canned-text', type=str, default='OK (canned)')
+    p.add_argument('--port', type=int, default=8888, help='proxy listen port')
+    p.add_argument('--first-delay', type=float, default=0.05, help='seconds to wait after forwarding first client bytes before closing client socket')
     p.add_argument('--reset-seconds', type=int, default=300, help='after this seconds the per-key counters are cleared')
-    p.add_argument('--upstream-timeout', type=int, default=10, help='timeout for upstream requests')
+    p.add_argument('--upstream-timeout', type=int, default=10, help='timeout for establishing upstream TCP connection (seconds)')
     args = p.parse_args()
 
-    server = ThreadedHTTPServer(('0.0.0.0', args.port), Handler)
-    server.target = args.target
-    server.mode = args.mode
-    server.delay = args.delay
-    server.canned_text = args.canned_text
+    server = ThreadedHTTPServer(('0.0.0.0', args.port), ConnectTimeoutHandler)
+    server.counter = defaultdict(lambda: (0,0.0))  # key -> (count, last_ts)
+    server.state_lock = threading.Lock()
+    server.first_delay = args.first_delay
+    server.reset_seconds = args.reset_seconds
     server.upstream_timeout = args.upstream_timeout
-    server.counter = defaultdict(int)
 
+    # cleanup thread to expire old keys
     def cleaner():
         while True:
-            time.sleep(args.reset_seconds)
-            server.counter.clear()
+            time.sleep(max(10, args.reset_seconds // 4))
+            now = time.time()
+            with server.state_lock:
+                to_del = []
+                for k, (cnt, ts) in list(server.counter.items()):
+                    if now - ts > server.reset_seconds:
+                        to_del.append(k)
+                for k in to_del:
+                    del server.counter[k]
 
     t = threading.Thread(target=cleaner, daemon=True)
     t.start()
 
-    print("SimpleProxyTimeout listening on 0.0.0.0:%d   mode=%s   target=%s" % (args.port, args.mode, args.target))
+    print(f"ConnectTimeoutProxy listening on 0.0.0.0:{args.port}")
+    print("Behavior: first CONNECT per (client_ip,target) -> forward client->server bytes then close client (simulate timeout).")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
