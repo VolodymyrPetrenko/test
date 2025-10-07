@@ -1,27 +1,16 @@
 #!/usr/bin/env python3
-# connect_timeout_proxy.py
-# CONNECT proxy that for the FIRST CONNECT from a (client_ip, target) will forward client->server bytes
-# but then close the client socket (simulating timeout) BEFORE returning server response.
-#
-# Subsequent CONNECTs for same (client_ip, target) act as normal tunnel.
+# connect_timeout_proxy_safe.py
+# CONNECT proxy that for the FIRST CONNECT from a (client_ip, target) will forward client->server bytes,
+# wait until TLS ClientHello is detected (or until a byte threshold), then wait `first_delay` and close client socket
+# (simulate timeout). Subsequent CONNECTs for the same key act as normal tunnel.
 #
 # Usage:
-#   python connect_timeout_proxy.py --port 8888 --first-delay 0.05 --reset-seconds 300
+#   python connect_timeout_proxy_safe.py --port 8888 --first-delay 0.5 --threshold 200 --reset-seconds 300
 #
-# Test (HTTPS):
-#   1) start proxy:
-#      python connect_timeout_proxy.py --port 8888
-#   2) first request (should fail / timeout on client side):
-#      curl -v -x http://localhost:8888 https://httpbin.org/get --http1.1
-#   3) second request (should succeed):
-#      curl -v -x http://localhost:8888 https://httpbin.org/get --http1.1
+# Test:
+#   curl -v -x http://localhost:8888 https://httpbin.org/get --http1.1
+#   First attempt should fail (client sees disconnect/time-out), second should succeed.
 #
-# Notes:
-# - Key used for first/second is (client_ip, target_host:port). If you prefer another key (header X-Test-Id),
-#   we can change it easily.
-# - If client is slow to send request bytes (e.g. slow handshake), increase --first-delay.
-# - This is NOT a MITM: proxy does not terminate TLS.
-
 import argparse
 import socket
 import threading
@@ -33,15 +22,24 @@ from collections import defaultdict
 
 BUFFER_SIZE = 16384
 
+def safe_close_sock(sock):
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    try:
+        sock.close()
+    except Exception:
+        pass
+
 class ConnectTimeoutHandler(BaseHTTPRequestHandler):
-    server_version = "ConnectTimeoutProxy/0.2"
+    server_version = "ConnectTimeoutProxySafe/0.3"
 
     def do_CONNECT(self):
-        target = self.path  # usually host:port
+        target = self.path  # expected "host:port"
         client_ip = self.client_address[0]
         key = (client_ip, target)
 
-        # parse host/port
         try:
             host, port_s = target.split(":", 1)
             port = int(port_s)
@@ -49,14 +47,13 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Bad CONNECT target")
             return
 
-        # try connect to remote
         try:
             remote = socket.create_connection((host, port), timeout=self.server.upstream_timeout)
         except Exception as e:
             self.send_error(502, f"Cannot connect to {target}: {e}")
             return
 
-        # send 200 Connection established
+        # Confirm tunnel
         try:
             self.send_response(200, "Connection established")
             self.end_headers()
@@ -68,45 +65,34 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
         remote.setblocking(False)
         client_sock.setblocking(False)
 
-        # determine first/second
+        # decide if first or not (with reset by time)
         first = False
+        now = time.time()
         with self.server.state_lock:
-            cnt, last = self.server.counter.get(key, (0, 0.0))
-            now = time.time()
-            if cnt == 0 or (now - last) > self.server.reset_seconds:
-                # first
+            cnt, last_ts = self.server.counter.get(key, (0, 0.0))
+            if cnt == 0 or (now - last_ts) > self.server.reset_seconds:
                 self.server.counter[key] = (1, now)
                 first = True
             else:
-                # increment and update timestamp
                 self.server.counter[key] = (cnt + 1, now)
                 first = False
 
         if first:
-            # For first connection: forward bytes client->remote for a short while (until we see some bytes),
-            # then schedule a close of client socket after first_delay seconds. We still forward remote->client
-            # only until we close client (we will not intentionally forward server's response).
+            print(f"[proxy] FIRST CONNECT detected for key={key}")
             closed_flag = threading.Event()
+            forwarded_total = 0
+            started_closer = False
+            closer_thread = None
 
-            # background closer: waits delay then closes client socket (if not already closed)
+            # function to close client after delay
             def closer(delay, sock, evt):
                 time.sleep(delay)
                 try:
-                    # shutdown and close client socket to simulate abrupt disconnect / timeout
-                    try:
-                        sock.shutdown(socket.SHUT_RDWR)
-                    except Exception:
-                        pass
-                    sock.close()
+                    safe_close_sock(sock)
                     evt.set()
-                    # log
-                    print(f"[proxy] first CONNECT -> closed client socket for key={key}")
+                    print(f"[proxy] closed client socket for key={key} after delay={delay}s")
                 except Exception as e:
                     print(f"[proxy] error closing client socket: {e}")
-
-            # We'll start closer after we have forwarded at least one client->remote chunk
-            started_closer = False
-            closer_thread = None
 
             sockets = [client_sock, remote]
             try:
@@ -118,19 +104,32 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
                         except Exception:
                             break
                         if not data:
+                            # client closed
                             break
                         # forward to remote
                         try:
                             remote.sendall(data)
                         except Exception:
                             break
-                        # once first data forwarded, start the closer thread (if not started)
-                        if (not started_closer):
-                            started_closer = True
-                            closer_thread = threading.Thread(target=closer, args=(self.server.first_delay, client_sock, closed_flag), daemon=True)
-                            closer_thread.start()
 
-                    # attempt to read from remote; but if we are in 'first' case we will not forward remote->client forever:
+                        forwarded_total += len(data)
+
+                        # TLS ClientHello detection:
+                        # TLS records usually start: 0x16 (Handshake), then version bytes (0x03 0x03 for TLS1.2, etc.)
+                        # Accept start when first byte == 0x16, or when forwarded_total exceeds threshold.
+                        if (not started_closer):
+                            first_byte = data[0] if len(data) > 0 else None
+                            if (first_byte == 0x16) or (forwarded_total >= self.server.threshold_bytes):
+                                # start closer thread
+                                started_closer = True
+                                closer_thread = threading.Thread(
+                                    target=closer,
+                                    args=(self.server.first_delay, client_sock, closed_flag),
+                                    daemon=True
+                                )
+                                closer_thread.start()
+                                print(f"[proxy] detected TLS/start condition for key={key} (first_byte={first_byte}, forwarded_total={forwarded_total}), starting closer in {self.server.first_delay}s")
+
                     if remote in r:
                         try:
                             data = remote.recv(BUFFER_SIZE)
@@ -138,28 +137,32 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
                             break
                         if not data:
                             break
-                        # For first request: if client is closed (closed_flag), stop forwarding; else attempt to forward but client may be closed soon
+                        # Only forward server->client if client still open
                         if not closed_flag.is_set():
                             try:
                                 client_sock.sendall(data)
                             except Exception:
-                                # client likely closed; we'll break
+                                # client likely closed
                                 break
                         else:
-                            # client already closed, we don't forward server response
+                            # client closed — stop proxying back
                             break
-                    # if closer_thread finished and client closed, break
+
                     if closed_flag.is_set():
+                        # we closed client intentionally — stop loop
                         break
+
             finally:
                 try: remote.close()
                 except: pass
                 try: client_sock.close()
                 except: pass
+
             return
 
         else:
-            # normal tunnel for second+ requests: full bidirectional proxy until either side closes
+            # Normal tunnel - full bidirectional proxy
+            print(f"[proxy] NORMAL CONNECT (subsequent) for key={key}")
             sockets = [client_sock, remote]
             try:
                 while True:
@@ -193,10 +196,9 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
                 except: pass
             return
 
-    # For plain HTTP requests (non-CONNECT) we implement a simple proxy pass-through (no special first behavior by default)
+    # Plain HTTP not implemented
     def do_REQUEST(self):
-        # Very simple: return 501 to indicate not implemented for plain HTTP in this script
-        self.send_error(501, "Plain HTTP proxying not implemented in this script. Use CONNECT (HTTPS) testing.")
+        self.send_error(501, "Plain HTTP proxying not implemented. Use CONNECT (HTTPS).")
     def do_GET(self): return self.do_REQUEST()
     def do_POST(self): return self.do_REQUEST()
     def do_PUT(self): return self.do_REQUEST()
@@ -206,7 +208,7 @@ class ConnectTimeoutHandler(BaseHTTPRequestHandler):
     def do_PATCH(self): return self.do_REQUEST()
 
     def log_message(self, format, *args):
-        # keep concise logging to console
+        # concise logging
         print("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), format%args))
 
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
@@ -215,22 +217,24 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--port', type=int, default=8888, help='proxy listen port')
-    p.add_argument('--first-delay', type=float, default=0.05, help='seconds to wait after forwarding first client bytes before closing client socket')
-    p.add_argument('--reset-seconds', type=int, default=300, help='after this seconds the per-key counters are cleared')
-    p.add_argument('--upstream-timeout', type=int, default=10, help='timeout for establishing upstream TCP connection (seconds)')
+    p.add_argument('--first-delay', type=float, default=0.5, help='seconds to wait after detecting TLS before closing client socket')
+    p.add_argument('--threshold', type=int, default=200, help='bytes forwarded from client->server to wait for before forcing closer if TLS marker not found')
+    p.add_argument('--reset-seconds', type=int, default=300, help='time after which first/second counters reset')
+    p.add_argument('--upstream-timeout', type=int, default=10, help='timeout for connecting to upstream (seconds)')
     args = p.parse_args()
 
     server = ThreadedHTTPServer(('0.0.0.0', args.port), ConnectTimeoutHandler)
-    server.counter = defaultdict(lambda: (0,0.0))  # key -> (count, last_ts)
+    server.counter = defaultdict(lambda: (0, 0.0))  # key -> (count, last_ts)
     server.state_lock = threading.Lock()
     server.first_delay = args.first_delay
+    server.threshold_bytes = args.threshold
     server.reset_seconds = args.reset_seconds
     server.upstream_timeout = args.upstream_timeout
 
-    # cleanup thread to expire old keys
+    # cleanup thread to remove stale keys
     def cleaner():
         while True:
-            time.sleep(max(10, args.reset_seconds // 4))
+            time.sleep(max(5, server.reset_seconds // 4))
             now = time.time()
             with server.state_lock:
                 to_del = []
@@ -243,8 +247,8 @@ def main():
     t = threading.Thread(target=cleaner, daemon=True)
     t.start()
 
-    print(f"ConnectTimeoutProxy listening on 0.0.0.0:{args.port}")
-    print("Behavior: first CONNECT per (client_ip,target) -> forward client->server bytes then close client (simulate timeout).")
+    print(f"ConnectTimeoutProxySafe listening on 0.0.0.0:{args.port}")
+    print("Behavior: first CONNECT per (client_ip,target) -> forward client->server bytes until TLS ClientHello or threshold, then close client after first-delay.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
