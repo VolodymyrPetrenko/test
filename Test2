@@ -6,9 +6,35 @@ import argparse
 # A set to store the IP addresses of clients that have made a request.
 seen_clients = set()
 
+def read_http_header(sock):
+    """
+    Reads from a socket until a complete HTTP header (\r\n\r\n) is received.
+    Returns the header as bytes, leaving the rest of the stream untouched.
+    """
+    header = b''
+    while True:
+        # Look for the end-of-header sequence
+        if b'\r\n\r\n' in header:
+            # Separate the header from any potential body/binary data that was read
+            header_part, _, rest = header.partition(b'\r\n\r\n')
+            # This is complex and not needed for a CONNECT request, but is good practice.
+            # For this proxy, we can simplify as the CONNECT request has no body.
+            break
+        
+        # Read a small chunk from the socket
+        chunk = sock.recv(64)
+        if not chunk:
+            # Client disconnected before sending a full header
+            return None
+        header += chunk
+    
+    # Return just the first line for our CONNECT request parsing
+    return header.split(b'\r\n')[0]
+
+
 def handle_client(client_socket, client_address, delay):
     """
-    Handles a single client connection.
+    Handles a single client connection with a robust header parsing method.
     """
     client_ip = client_address[0]
 
@@ -22,48 +48,44 @@ def handle_client(client_socket, client_address, delay):
     print(f"Subsequent request from {client_ip}. Proceeding normally.")
 
     try:
-        # Receive the initial data packet as raw bytes.
-        request_data = client_socket.recv(1024)
-        if not request_data:
+        # ======================= THE ROBUST FIX =======================
+        # Use our new function to reliably read only the first line of the header.
+        first_line_bytes = read_http_header(client_socket)
+        # =============================================================
+        
+        if not first_line_bytes:
+            print("Client disconnected before sending data.")
             client_socket.close()
             return
+            
+        # Add detailed logging for debugging
+        print(f"[*] Received raw header line: {first_line_bytes}")
 
-        # ======================= THE CRITICAL FIX IS HERE =======================
-        #
-        # 1. Split the raw bytes by the newline character (b'\r\n').
-        # 2. Take only the first element ([0]), which is the first line.
-        # 3. NOW it is safe to decode that single line as UTF-8.
-        #
-        first_line = request_data.split(b'\r\n')[0].decode('utf-8')
-        # ======================================================================
-
-        method, url, _ = first_line.split()
+        # Now it is completely safe to decode this isolated line.
+        first_line_str = first_line_bytes.decode('utf-8')
+        method, url, _ = first_line_str.split()
 
     except Exception as e:
-        # This is the error you are seeing. It happens if the above fix is not applied.
-        print(f"Error parsing initial request line: {e}")
+        print(f"CRITICAL ERROR during request parsing: {e}")
         client_socket.close()
         return
 
     if method == 'CONNECT':
         try:
-            # Extract destination host and port from the URL
-            if ':' in url:
-                dest_host, dest_port_str = url.split(':')
-                dest_port = int(dest_port_str)
-            else:
-                dest_host = url
-                dest_port = 443 # Default HTTPS port
+            dest_host, dest_port_str = url.split(':')
+            dest_port = int(dest_port_str)
+        except ValueError:
+            dest_host = url
+            dest_port = 443 # Default HTTPS port
 
-            # Connect to the actual destination server
+        print(f"[*] Tunneling request for {dest_host}:{dest_port}")
+
+        try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.connect((dest_host, dest_port))
-
-            # Inform the client that the tunnel is ready
             client_socket.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
 
-            # Start relaying data in both directions (client <--> server)
-            def forward(source, destination):
+            def forward(source, destination, direction):
                 while True:
                     try:
                         data = source.recv(4096)
@@ -71,13 +93,14 @@ def handle_client(client_socket, client_address, delay):
                             destination.sendall(data)
                         else:
                             break
-                    except OSError: # Handles socket closure
+                    except OSError:
                         break
+                print(f"[*] Tunnel {direction} closed.")
                 source.close()
                 destination.close()
 
-            threading.Thread(target=forward, args=(client_socket, server_socket)).start()
-            threading.Thread(target=forward, args=(server_socket, client_socket)).start()
+            threading.Thread(target=forward, args=(client_socket, server_socket, f"{client_ip} -> Server")).start()
+            threading.Thread(target=forward, args=(server_socket, client_socket, f"Server -> {client_ip}")).start()
 
         except Exception as e:
             print(f"Error connecting to destination {dest_host}:{dest_port}: {e}")
@@ -87,10 +110,7 @@ def handle_client(client_socket, client_address, delay):
         client_socket.close()
 
 def main():
-    """
-    Main function to parse arguments and start the proxy server.
-    """
-    parser = argparse.ArgumentParser(description="Proxy server that times out on the first request.")
+    parser = argparse.ArgumentParser(description="A robust proxy server that times out on the first request from a client.")
     parser.add_argument('--delay', type=int, default=10, help='The delay in seconds for the initial timeout. Default is 10.')
     args = parser.parse_args()
     
@@ -103,7 +123,7 @@ def main():
     server.bind((host, port))
     server.listen(5)
 
-    print(f"[*] Listening on {host}:{port}")
+    print(f"[*] Robust proxy listening on {host}:{port}")
     print(f"[*] Initial request timeout is set to {delay_seconds} seconds.")
 
     while True:
