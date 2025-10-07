@@ -1,7 +1,7 @@
 import socket
 import threading
 import time
-import argparse  # Import the argparse library
+import argparse
 
 # A set to store the IP addresses of clients that have made a request.
 seen_clients = set()
@@ -9,56 +9,60 @@ seen_clients = set()
 def handle_client(client_socket, client_address, delay):
     """
     Handles a single client connection.
-    The 'delay' parameter specifies the timeout duration in seconds.
     """
     client_ip = client_address[0]
 
     if client_ip not in seen_clients:
-        # First request from this client, simulate a timeout.
         print(f"First request from {client_ip}. Simulating timeout for {delay} seconds.")
         seen_clients.add(client_ip)
-        time.sleep(delay)  # Use the delay parameter here
+        time.sleep(delay)
         client_socket.close()
         return
 
-    # Subsequent request from this client.
     print(f"Subsequent request from {client_ip}. Proceeding normally.")
 
-    # Get the request from the client. It should be a CONNECT request.
     try:
+        # Receive the initial data packet as raw bytes.
         request_data = client_socket.recv(1024)
         if not request_data:
             client_socket.close()
             return
 
-        # We only need the first line to process the CONNECT request.
-        # The rest might be the start of the TLS handshake (binary data).
+        # ======================= THE CRITICAL FIX IS HERE =======================
+        #
+        # 1. Split the raw bytes by the newline character (b'\r\n').
+        # 2. Take only the first element ([0]), which is the first line.
+        # 3. NOW it is safe to decode that single line as UTF-8.
+        #
         first_line = request_data.split(b'\r\n')[0].decode('utf-8')
+        # ======================================================================
+
         method, url, _ = first_line.split()
 
     except Exception as e:
+        # This is the error you are seeing. It happens if the above fix is not applied.
         print(f"Error parsing initial request line: {e}")
         client_socket.close()
         return
 
     if method == 'CONNECT':
         try:
-            dest_host, dest_port_str = url.split(':')
-            dest_port = int(dest_port_str)
-        except ValueError:
-            # If the port is not specified, default to 443 for HTTPS
-            dest_host = url
-            dest_port = 443
+            # Extract destination host and port from the URL
+            if ':' in url:
+                dest_host, dest_port_str = url.split(':')
+                dest_port = int(dest_port_str)
+            else:
+                dest_host = url
+                dest_port = 443 # Default HTTPS port
 
-        try:
-            # Create a socket to connect to the destination server
+            # Connect to the actual destination server
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.connect((dest_host, dest_port))
 
-            # Send a "200 Connection established" response to the client
+            # Inform the client that the tunnel is ready
             client_socket.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
 
-            # Start tunneling data between the client and the server
+            # Start relaying data in both directions (client <--> server)
             def forward(source, destination):
                 while True:
                     try:
@@ -67,12 +71,11 @@ def handle_client(client_socket, client_address, delay):
                             destination.sendall(data)
                         else:
                             break
-                    except Exception:
+                    except OSError: # Handles socket closure
                         break
                 source.close()
                 destination.close()
 
-            # Start forwarding in both directions
             threading.Thread(target=forward, args=(client_socket, server_socket)).start()
             threading.Thread(target=forward, args=(server_socket, client_socket)).start()
 
@@ -83,19 +86,15 @@ def handle_client(client_socket, client_address, delay):
         print(f"Received non-CONNECT method: {method}. Closing connection.")
         client_socket.close()
 
-
 def main():
     """
-    Main function to start the proxy server.
+    Main function to parse arguments and start the proxy server.
     """
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description="Proxy server that times out on the first request from a client.")
+    parser = argparse.ArgumentParser(description="Proxy server that times out on the first request.")
     parser.add_argument('--delay', type=int, default=10, help='The delay in seconds for the initial timeout. Default is 10.')
     args = parser.parse_args()
     
-    # Assign the delay from the parsed arguments
     delay_seconds = args.delay
-
     host = '127.0.0.1'
     port = 8888
 
@@ -110,7 +109,6 @@ def main():
     while True:
         client_socket, addr = server.accept()
         print(f"[*] Accepted connection from: {addr[0]}:{addr[1]}")
-        # Pass the delay to the client handler thread
         client_handler = threading.Thread(target=handle_client, args=(client_socket, addr, delay_seconds))
         client_handler.start()
 
